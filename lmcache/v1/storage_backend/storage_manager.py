@@ -23,7 +23,7 @@ import torch
 # First Party
 from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
-from lmcache.observability import PrometheusLogger
+from lmcache.observability import LMCStatsMonitor, PrometheusLogger
 from lmcache.utils import (
     CacheEngineKey,
     _lmcache_nvtx_annotate,
@@ -197,7 +197,7 @@ class StorageManager:
             name="storage-manger-event-loop",
         )
         self.thread.start()
-
+        self._stats_monitor = LMCStatsMonitor.GetOrCreate()
         # For scheduler role, always use CPU device
         if is_cuda_worker(metadata):
             dst_device = "cuda"
@@ -519,6 +519,7 @@ class StorageManager:
         lookup_id: str,
         cum_chunk_lengths_total: list[int],
         tier_expected_chunks: list[int],
+        request_id: int,
     ) -> None:
         """
         Callback function when all prefetch tasks
@@ -593,6 +594,7 @@ class StorageManager:
             f"Responding to scheduler for lookup id {lookup_id}"
             f" with retrieved length {retrieved_length}"
         )
+        self._stats_monitor.on_lookup_finished(request_id, retrieved_length)
         self.async_lookup_server.send_response_to_scheduler(lookup_id, retrieved_length)
 
     async def async_lookup_and_prefetch(
@@ -622,7 +624,9 @@ class StorageManager:
         "LocalDiskBackend"] for now. If None, search in all backends.
         :param bool pin: Whether to pin the keys.
         """
-
+        request_id = self._stats_monitor.on_lookup_request(
+            num_tokens=cum_chunk_lengths[-1]
+        )
         # NOTE(Jiayi): Currently, the retrieval pattern is always
         # prefix-based. That is, we retrieve 0-t1 tokens from backend 1
         # and retrieve t1-t2 tokens from backend 2, etc. The assumption
@@ -707,6 +711,7 @@ class StorageManager:
                 lookup_id,
                 cum_chunk_lengths_total,
                 tier_expected_chunks,
+                request_id,
             )
         )
 
