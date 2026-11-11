@@ -23,6 +23,7 @@ import enum
 import itertools
 import select
 import threading
+import time
 
 # First Party
 from lmcache.lmcache_native import Bitmap
@@ -49,6 +50,10 @@ from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_controllers.adapter_lifecycle import (
     AddAdapterOp,
     RemoveAdapterOp,
+)
+from lmcache.v1.distributed.storage_controllers.l2_load_breaker import (
+    L2LoadBreaker,
+    L2LoadBreakerState,
 )
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     PrefetchPolicy,
@@ -453,6 +458,9 @@ class InFlightPrefetchRequest:
     # Entries are removed as load results arrive.
     load_bytes_by_adapter: dict[int, int] = field(default_factory=dict)
 
+    # L2 adapter idx -> monotonic time its in-flight load was submitted.
+    load_submitted_at: dict[int, float] = field(default_factory=dict)
+
     # Cells loaded from L2 so far, one row per key group; empty until the
     # first load result is admitted.
     l2_loaded_cells: Bitmap2D = field(default_factory=lambda: Bitmap2D([]))
@@ -506,8 +514,9 @@ class PrefetchController(StorageControllerInterface):
        An L1-only request (no allowed or no attached L2 adapter) is served on
        the calling thread and is complete when the call returns.
     2. Read-locks the keys resident in the allowed L1 managers and submits
-       lookup-and-lock tasks to every live, allowed L2 adapter, unless L1
-       alone serves the request; that request finishes here.
+       lookup-and-lock tasks to every live, allowed L2 adapter whose load
+       breaker admits it, unless L1 alone serves the request; that request
+       finishes here.
     3. Plans which cells to serve from L1 and which to load from L2, and
        releases every lock outside the plan.
     4. Reserves L1 staging buffers for the L2 plan; on reservation failures
@@ -528,6 +537,11 @@ class PrefetchController(StorageControllerInterface):
         inflight_watermark: Fraction of an L1 manager's capacity that
             in-flight prefetch requests may stage before new requests wait,
             in ``(0, 1]``.
+        load_min_throughput_gbps: Load throughput floor in GB/s below which
+            an L2 adapter is skipped by new prefetches (see
+            :class:`L2LoadBreaker`). 0 disables the check.
+        load_breaker_open_seconds: How long a slow adapter is skipped before
+            a probe request may use it again.
     """
 
     # Singleton dispatch for the in-flight load gauges: tests may construct
@@ -545,6 +559,8 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: list[L2AdapterDescriptor],
         policy: PrefetchPolicy,
         inflight_watermark: float = 0.5,
+        load_min_throughput_gbps: float = 0.0,
+        load_breaker_open_seconds: float = 30.0,
     ) -> None:
         self._l1_managers: dict[int, L1ManagerInterface] = {
             desc.index: mgr
@@ -571,6 +587,14 @@ class PrefetchController(StorageControllerInterface):
 
         # Adapters being removed: adapter id -> event set once detached.
         self._draining: dict[int, threading.Event] = {}
+
+        # One load breaker per adapter; skips adapters too slow to load from.
+        self._load_min_throughput_gbps = load_min_throughput_gbps
+        self._load_breaker_open_seconds = load_breaker_open_seconds
+        self._load_breakers: dict[int, L2LoadBreaker] = {
+            idx: self._make_load_breaker(desc)
+            for idx, desc in self._adapter_descriptors.items()
+        }
 
         # Control-plane queue for runtime add/remove, used by the internal
         # loop thread
@@ -641,6 +665,19 @@ class PrefetchController(StorageControllerInterface):
                 ),
                 lambda: (
                     PrefetchController._gauge_target.get_adapter_state_observations()
+                    if PrefetchController._gauge_target is not None
+                    else []
+                ),
+            )
+            register_gauge(
+                "lmcache.l2_prefetch",
+                "lmcache_mp.l2_load_breaker_state",
+                (
+                    "Load breaker state per L2 adapter: 0 closed, 1 open "
+                    "(skipped by new prefetches), 2 half-open (probing)."
+                ),
+                lambda: (
+                    PrefetchController._gauge_target.get_load_breaker_observations()
                     if PrefetchController._gauge_target is not None
                     else []
                 ),
@@ -763,6 +800,10 @@ class PrefetchController(StorageControllerInterface):
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - len(self._draining),
             "num_draining_adapters": len(self._draining),
+            "num_load_breaker_open_adapters": sum(
+                breaker.state != L2LoadBreakerState.CLOSED
+                for breaker in self._load_breakers.copy().values()
+            ),
         }
 
     def get_adapter_state_observations(
@@ -826,6 +867,33 @@ class PrefetchController(StorageControllerInterface):
                 (reserved_bytes, {"l2_name": desc.type_name, "adapter_index": idx})
             )
         return observations
+
+    def get_load_breaker_observations(
+        self,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """Return per-adapter ``(breaker_state, attributes)`` pairs.
+
+        Note:
+            Reads a ``dict.copy()`` snapshot, which is safe from the OTel
+            reader thread without locking.
+        """
+        observations: list[tuple[int | float, dict[str, object]]] = []
+        for idx, breaker in self._load_breakers.copy().items():
+            desc = self._adapter_descriptors.get(idx)
+            if desc is None:
+                continue
+            observations.append(
+                (int(breaker.state), {"l2_name": desc.type_name, "adapter_index": idx})
+            )
+        return observations
+
+    def _make_load_breaker(self, desc: L2AdapterDescriptor) -> L2LoadBreaker:
+        """Create the load breaker of the adapter ``desc`` describes."""
+        return L2LoadBreaker(
+            name=f"{desc.type_name}[{desc.index}]",
+            min_throughput_gbps=self._load_min_throughput_gbps,
+            open_seconds=self._load_breaker_open_seconds,
+        )
 
     # =========================================================================
     # Lifecycle
@@ -1026,6 +1094,9 @@ class PrefetchController(StorageControllerInterface):
                 )
                 self._l2_adapters[op.adapter_id] = op.adapter
                 self._adapter_descriptors[op.adapter_id] = op.descriptor
+                self._load_breakers[op.adapter_id] = self._make_load_breaker(
+                    op.descriptor
+                )
                 lookup_efd = op.adapter.get_lookup_and_lock_event_fd()
                 load_efd = op.adapter.get_load_event_fd()
                 self._lookup_efd_to_adapter[lookup_efd] = op.adapter_id
@@ -1071,6 +1142,7 @@ class PrefetchController(StorageControllerInterface):
             adapter = self._l2_adapters.pop(adapter_id)
             self._adapter_descriptors.pop(adapter_id, None)
             self._l2_affinity.pop(adapter_id, None)
+            self._load_breakers.pop(adapter_id, None)
             lookup_efd = adapter.get_lookup_and_lock_event_fd()
             load_efd = adapter.get_load_event_fd()
             self._lookup_efd_to_adapter.pop(lookup_efd, None)
@@ -1169,11 +1241,13 @@ class PrefetchController(StorageControllerInterface):
         flattened_keys = request.get_flattened_keys()
         self._lock_l1_keys(request)
 
-        # Submit lookup requests to the eligible L2 adapters.
+        # Submit lookup requests to the eligible L2 adapters whose load
+        # breaker admits the request.
         active_adapters = {
             adapter_idx: adapter
             for adapter_idx, adapter in self._l2_adapters.items()
             if self._is_l2_eligible(request, adapter_idx)
+            and self._load_breakers[adapter_idx].admit(request_id)
         }
 
         # No eligible L2 adapter, or no L2 result could change the plan: serve
@@ -1359,11 +1433,13 @@ class PrefetchController(StorageControllerInterface):
         states = request.key_states
 
         # Step 1 and 2: plan on the lookup results and release what the plan
-        # leaves out. Only eligible L2 adapters are planned.
+        # leaves out. Only eligible L2 adapters whose load breaker still
+        # allows the request are planned.
         active_l2_descs = {
             l2_idx: desc
             for l2_idx, desc in self._adapter_descriptors.items()
             if self._is_l2_eligible(request, l2_idx)
+            and self._load_breakers[l2_idx].allows(request.request_id)
         }
         self._plan_load(request, active_l2_descs)
 
@@ -1456,6 +1532,7 @@ class PrefetchController(StorageControllerInterface):
             objects = [reserved_objs[key] for key in keys]
             task_id = self._l2_adapters[l2_idx].submit_load_task(keys, objects)
             request.inflight_load_tasks[l2_idx] = task_id
+            request.load_submitted_at[l2_idx] = time.monotonic()
             plan_keys.extend(keys)
 
             # Groups may differ in object size, so sum per object.
@@ -1632,7 +1709,11 @@ class PrefetchController(StorageControllerInterface):
             states.l1_reserved_keys[l1_idx] -= planned
             del states.l2_locked_keys[adapter_idx]
             del request.inflight_load_tasks[adapter_idx]
-            request.load_bytes_by_adapter.pop(adapter_idx, None)
+            self._load_breakers[adapter_idx].record_load(
+                request.request_id,
+                request.load_bytes_by_adapter.pop(adapter_idx),
+                time.monotonic() - request.load_submitted_at.pop(adapter_idx),
+            )
 
             self._event_bus.publish(
                 Event(
@@ -1784,6 +1865,8 @@ class PrefetchController(StorageControllerInterface):
     def _retire_request(self, request: InFlightPrefetchRequest) -> None:
         """Remove a finished request from the in-flight table."""
         self._in_flight_requests.pop(request.request_id, None)
+        for breaker in self._load_breakers.values():
+            breaker.release(request.request_id)
 
     def _release_all_locks(self, request: InFlightPrefetchRequest) -> None:
         """Return every lock and buffer the request's key states record.

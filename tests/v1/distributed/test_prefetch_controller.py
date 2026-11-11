@@ -56,6 +56,9 @@ from lmcache.v1.distributed.l2_adapters.raw_block_l2_adapter import (
     RawBlockL2Adapter,
     RawBlockL2AdapterConfig,
 )
+from lmcache.v1.distributed.storage_controllers.l2_load_breaker import (
+    MIN_SAMPLES_TO_OPEN,
+)
 from lmcache.v1.distributed.storage_controllers.prefetch_controller import (
     PrefetchController,
 )
@@ -188,6 +191,7 @@ def make_controller(
     adapters: list,
     policy: PrefetchPolicy | None = None,
     inflight_watermark: float = 0.5,
+    load_min_throughput_gbps: float = 0.0,
 ) -> PrefetchController:
     """Build a controller over one L1 manager and the given adapters."""
     return PrefetchController(
@@ -197,6 +201,7 @@ def make_controller(
         adapter_descriptors=[make_descriptor(i) for i in range(len(adapters))],
         policy=policy or DefaultPrefetchPolicy(),
         inflight_watermark=inflight_watermark,
+        load_min_throughput_gbps=load_min_throughput_gbps,
     )
 
 
@@ -356,6 +361,7 @@ class TestLifecycle:
         assert status["num_l2_adapters"] == 1
         assert status["num_active_adapters"] == 1
         assert status["num_draining_adapters"] == 0
+        assert status["num_load_breaker_open_adapters"] == 0
         assert status["in_flight_request_count"] == 0
         assert status["pending_queue_size"] == 0
         ctrl.stop()
@@ -1001,6 +1007,63 @@ class TestAdmission:
         l1_manager.finish_read(keys)
         for key in keys:
             assert l1_manager.get_object_state(key) is None
+
+
+# =============================================================================
+# Load breaker
+# =============================================================================
+
+
+class TestLoadBreaker:
+    def test_adapter_below_throughput_floor_is_skipped(self, l1_manager):
+        """Once an adapter's loads stay below the floor, new requests skip it
+        and leave its keys unlocked; the earlier requests were served."""
+        adapter = make_adapter()
+        layout = make_layout()
+        key_sets = [
+            [make_object_key(10 * i + j) for j in range(2)]
+            for i in range(MIN_SAMPLES_TO_OPEN + 1)
+        ]
+        store_keys_in_l2(adapter, [k for keys in key_sets for k in keys], layout)
+        # No load reaches this floor.
+        ctrl = make_controller(l1_manager, [adapter], load_min_throughput_gbps=1e9)
+        ctrl.start()
+
+        for keys in key_sets[:-1]:
+            req_id = ctrl.submit_prefetch_request(single_row_spec(keys))
+            assert hit_counts(wait_for_result(ctrl, req_id)) == (0, 2)
+            l1_manager.finish_read(keys)
+        assert ctrl.report_status()["num_load_breaker_open_adapters"] == 1
+
+        req_id = ctrl.submit_prefetch_request(single_row_spec(key_sets[-1]))
+        result = wait_for_result(ctrl, req_id)
+
+        assert hit_counts(result) == (0, 0)
+        assert_absent(l1_manager, key_sets[-1])
+        assert_l2_unlocked(adapter)
+        ctrl.stop()
+        adapter.close()
+
+    def test_adapter_above_throughput_floor_is_kept(self, l1_manager):
+        """An adapter whose loads reach the floor keeps serving requests."""
+        adapter = make_adapter()
+        layout = make_layout()
+        key_sets = [
+            [make_object_key(10 * i + j) for j in range(2)]
+            for i in range(MIN_SAMPLES_TO_OPEN + 1)
+        ]
+        store_keys_in_l2(adapter, [k for keys in key_sets for k in keys], layout)
+        ctrl = make_controller(l1_manager, [adapter], load_min_throughput_gbps=1e-9)
+        ctrl.start()
+
+        for keys in key_sets:
+            req_id = ctrl.submit_prefetch_request(single_row_spec(keys))
+            assert hit_counts(wait_for_result(ctrl, req_id)) == (0, 2)
+            l1_manager.finish_read(keys)
+
+        assert ctrl.report_status()["num_load_breaker_open_adapters"] == 0
+        ctrl.stop()
+        adapter.close()
 
 
 # =============================================================================

@@ -707,6 +707,16 @@ Source: ``lmcache/v1/distributed/config.py``
      - (none)
      - Deprecated and ignored; prefetch admission follows
        ``--l2-prefetch-inflight-watermark``.  Logs a warning when set.
+   * - ``--l2-load-min-throughput-gbps``
+     - ``0``
+     - L2 -> L1 load throughput floor in GB/s.  An L2 adapter whose moving
+       average load throughput falls below it is skipped by new prefetches,
+       which recompute their misses instead.  ``0`` disables the check.
+       See :ref:`l2-slow-adapter-skip`.
+   * - ``--l2-load-breaker-open-seconds``
+     - ``30``
+     - Seconds a slow L2 adapter is skipped before one prefetch request
+       probes it again.
    * - ``--periodic-notifier-interval-ms``
      - ``5``
      - Interval in milliseconds for the periodic event notifier

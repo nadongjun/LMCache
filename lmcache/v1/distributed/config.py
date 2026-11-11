@@ -696,6 +696,15 @@ class StorageManagerConfig:
     """ Fraction of each L1's capacity that in-flight L2 prefetches may stage
     before new prefetch requests wait, in (0, 1]. """
 
+    l2_load_min_throughput_gbps: float = 0.0
+    """ L2 -> L1 load throughput floor in GB/s. An L2 adapter whose moving
+    average load throughput falls below it is skipped by new prefetches, so
+    their misses are recomputed. 0 disables the check. """
+
+    l2_load_breaker_open_seconds: float = 30.0
+    """ Seconds a slow L2 adapter is skipped before one prefetch request
+    probes it again. """
+
     periodic_notifier_interval_ms: int = 5
     """ Interval (ms) for the periodic event notifier heartbeat. """
 
@@ -725,6 +734,16 @@ class StorageManagerConfig:
             raise ValueError(
                 "prefetch_inflight_watermark must be in (0, 1], got "
                 f"{self.prefetch_inflight_watermark}"
+            )
+        if self.l2_load_min_throughput_gbps < 0:
+            raise ValueError(
+                "l2_load_min_throughput_gbps must be >= 0, got "
+                f"{self.l2_load_min_throughput_gbps}"
+            )
+        if self.l2_load_breaker_open_seconds <= 0:
+            raise ValueError(
+                "l2_load_breaker_open_seconds must be > 0, got "
+                f"{self.l2_load_breaker_open_seconds}"
             )
         validate_storage_manager_config(self)
 
@@ -1025,6 +1044,22 @@ def add_storage_manager_args(
         help="Fraction of L1 capacity, in (0, 1], that in-flight L2 prefetch "
         "requests may stage before new prefetch requests wait. Default is 0.5.",
     )
+    policy_group.add_argument(
+        "--l2-load-min-throughput-gbps",
+        type=float,
+        default=0.0,
+        help="L2 -> L1 load throughput floor in GB/s. An L2 adapter whose "
+        "moving average load throughput falls below it is skipped by new "
+        "prefetches, which then recompute their misses. 0 (default) disables "
+        "the check.",
+    )
+    policy_group.add_argument(
+        "--l2-load-breaker-open-seconds",
+        type=float,
+        default=30.0,
+        help="Seconds a slow L2 adapter is skipped before one prefetch request "
+        "probes it again. Default is 30.",
+    )
     # Deprecated: released deployers (operator) still render this flag into
     # server args, and rejecting it crashes the pod on startup.
     policy_group.add_argument(
@@ -1143,6 +1178,8 @@ def parse_args_to_config(
             store_policy=args.l2_store_policy,
             prefetch_policy=args.l2_prefetch_policy,
             prefetch_inflight_watermark=args.l2_prefetch_inflight_watermark,
+            l2_load_min_throughput_gbps=args.l2_load_min_throughput_gbps,
+            l2_load_breaker_open_seconds=args.l2_load_breaker_open_seconds,
             periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
         )
     if args.l1_size_gb is None or defaults is None:
@@ -1226,6 +1263,8 @@ def parse_args_to_config(
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_inflight_watermark=args.l2_prefetch_inflight_watermark,
+        l2_load_min_throughput_gbps=args.l2_load_min_throughput_gbps,
+        l2_load_breaker_open_seconds=args.l2_load_breaker_open_seconds,
         periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
     )
     return config

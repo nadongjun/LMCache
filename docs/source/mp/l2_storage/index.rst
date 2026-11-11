@@ -148,6 +148,48 @@ L1 room for stores and resident data.
      - (none)
      - Deprecated and ignored; logs a warning when set.
 
+.. _l2-slow-adapter-skip:
+
+Skipping Slow Adapters
+~~~~~~~~~~~~~~~~~~~~~~
+
+Loading a prefix from L2 pays off only while it is faster than recomputing
+it.  The connection circuit breakers of the S3, Bigtable and Valkey adapters
+open on failed requests, so an adapter whose loads succeed but are slow (a
+congested or long-distance link, an overloaded backend) is still used and
+delays every request that hits it.
+
+With ``--l2-load-min-throughput-gbps`` set, the prefetch controller keeps a
+moving average of each adapter's load throughput, measured like the
+``lmcache_mp.l2_load_throughput`` histogram: bytes over the time from
+submitting the load task to its completion.  When the average falls below
+the floor, new prefetch requests skip that adapter and recompute what they
+would have loaded.  After ``--l2-load-breaker-open-seconds``, one request
+loads from the adapter again as a probe; if its load reaches the floor the
+adapter is used again, otherwise it stays skipped for another period.
+
+A starting point for the floor is the rate at which the engine recomputes
+KV cache: KV bytes per token times prefill tokens per second.  For example,
+a model with 128 KiB of KV cache per token that prefills 10,000 tokens/s
+recomputes about 1.3 GB/s; loads slower than that do not save time.
+
+The ``lmcache_mp.l2_load_breaker_state`` gauge reports each adapter's state
+(0 used, 1 skipped, 2 probing), and the skip and recovery are logged.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 15 55
+
+   * - Flag
+     - Default
+     - Description
+   * - ``--l2-load-min-throughput-gbps``
+     - ``0``
+     - Load throughput floor in GB/s; ``0`` disables the check.
+   * - ``--l2-load-breaker-open-seconds``
+     - ``30``
+     - Seconds a slow adapter is skipped before a probe request.
+
 Buffer-Only Mode
 ~~~~~~~~~~~~~~~~~
 
